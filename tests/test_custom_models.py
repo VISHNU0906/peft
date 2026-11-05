@@ -5550,6 +5550,62 @@ class TestMultiRankAdapter:
                     )
 
 
+class TestRankDropoutAllRowsDropped:
+    # Regression test for https://github.com/huggingface/peft/issues/4117: with rank_dropout=1.0 every row of the
+    # dropout mask is dropped. Rescaling by the mask mean used to divide by zero and turn the output into NaN.
+    # Dropping every row should leave the base layer output unchanged instead.
+
+    class LinearModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.lin0 = nn.Linear(10, 20)
+            self.lin1 = nn.Linear(20, 2)
+
+        def forward(self, x):
+            return self.lin1(self.lin0(x))
+
+    class ConvModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.conv = nn.Conv2d(3, 4, 3)
+
+        def forward(self, x):
+            return self.conv(x)
+
+    @pytest.mark.parametrize(
+        "config_cls, config_kwargs",
+        [
+            (LoHaConfig, {}),
+            (LoKrConfig, {"rank_dropout_scale": True}),
+        ],
+    )
+    @pytest.mark.parametrize(
+        "model_cls, target_modules, input_shape",
+        [(LinearModel, ["lin0", "lin1"], (4, 10)), (ConvModel, ["conv"], (2, 3, 8, 8))],
+    )
+    def test_all_rows_dropped_returns_base_output(
+        self, config_cls, config_kwargs, model_cls, target_modules, input_shape
+    ):
+        torch.manual_seed(0)
+        base_model = model_cls().eval()
+        x = torch.randn(*input_shape)
+        with torch.no_grad():
+            expected = base_model(x)
+
+        config = config_cls(target_modules=target_modules, init_weights=False, rank_dropout=1.0, **config_kwargs)
+        model = get_peft_model(copy.deepcopy(base_model), config)
+        model.train()
+        output = model(x)
+
+        assert torch.isfinite(output).all()
+        assert torch.allclose(output, expected)
+
+        output.sum().backward()
+        for name, param in model.named_parameters():
+            if param.requires_grad and param.grad is not None:
+                assert torch.isfinite(param.grad).all(), name
+
+
 class TestLayerRepr:
     """Tests related to the repr of adapted models"""
 

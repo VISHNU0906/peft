@@ -213,7 +213,10 @@ class LoHaLayer(nn.Module, LycorisLayer):
             # TODO: Investigate if there should be a scaler like in normal dropout during training
             # Original implementation doesn't have it
             # https://github.com/KohakuBlueleaf/LyCORIS/blob/eb460098187f752a5d66406d3affade6f0a07ece/lycoris/modules/loha.py#L193
-            drop /= drop.mean()
+            # if every row is dropped, the mean is 0; keep the zero mask instead of dividing by it
+            keep_ratio = drop.mean()
+            if keep_ratio > 0:
+                drop /= keep_ratio
             weight *= drop
 
         return weight
