@@ -114,6 +114,9 @@ class RandLoraModel(BaseTuner):
             if not self._check_target_module_exists(peft_config, key):
                 continue
 
+            if isinstance(module, BaseTunerLayer):
+                module = module.get_base_layer()
+
             if isinstance(module, nn.Linear):
                 module_shape = module.out_features, module.in_features
             elif isinstance(module, Conv1D):
@@ -142,10 +145,6 @@ class RandLoraModel(BaseTuner):
 
         linear_out_dim, linear_in_dim = self._find_dim(config)
         max_dim, min_dim = max(linear_out_dim, linear_in_dim), min(linear_out_dim, linear_in_dim)
-
-        # use of persistent to exclude randlora_A and randlora_B from the state dict if we choose not to save them.
-        self.randlora_A = BufferDict({}, persistent=config.save_projection)
-        self.randlora_B = BufferDict({}, persistent=config.save_projection)
 
         # deterministic init of randlora_A and randlora_B if we know the key
         generator = torch.Generator(device="cpu").manual_seed(config.projection_prng_key)
@@ -180,10 +179,6 @@ class RandLoraModel(BaseTuner):
         linear_out_dim, linear_in_dim = self._find_dim(config)
         max_dim, min_dim = max(linear_out_dim, linear_in_dim), min(linear_out_dim, linear_in_dim)
 
-        # use of persistent to exclude randlora_A and randlora_B from the state dict if we choose not to save them.
-        self.randlora_A = BufferDict({}, persistent=config.save_projection)
-        self.randlora_B = BufferDict({}, persistent=config.save_projection)
-
         # deterministic init of randlora_A and randlora_B if we know the key
         generator = torch.Generator(device="cpu").manual_seed(config.projection_prng_key)
 
@@ -204,6 +199,11 @@ class RandLoraModel(BaseTuner):
         self.randlora_B[adapter_name] = randlora_B
 
     def _pre_injection_hook(self, model: nn.Module, config: RandLoraConfig, adapter_name: str) -> None:
+        if not hasattr(self, "randlora_A"):
+            # Keep the containers shared with existing layers when initializing another adapter's projections.
+            self.randlora_A = BufferDict({}, persistent=config.save_projection)
+            self.randlora_B = BufferDict({}, persistent=config.save_projection)
+
         if config.very_sparse:
             linear_out_dim, linear_in_dim = self._find_dim(config)
             self._init_randlora_A_randlora_B_sparse(
@@ -314,6 +314,14 @@ class RandLoraModel(BaseTuner):
             raise ValueError("Current Key shouldn't be `None`")
 
         r = randlora_config.r
+        if adapter_name not in self.randlora_A:
+            # A smaller rank needs more bases, so slicing projections from a different rank is not sufficient.
+            # Initialize projections using this adapter's config, as when loading it on its own. Adapters with
+            # the same rank can still share projections without changing existing checkpoints.
+            matching_adapter = next((name for name, basis in self.randlora_A.items() if basis.shape[0] == r), None)
+            if matching_adapter is None:
+                self._pre_injection_hook(self.model, randlora_config, adapter_name)
+
         bias = hasattr(target, "bias") and target.bias is not None
         kwargs = {
             "r": r,
@@ -322,7 +330,7 @@ class RandLoraModel(BaseTuner):
             "loaded_in_4bit": getattr(self.model, "is_loaded_in_4bit", False),
         }
         kwargs["bias"] = bias
-        if isinstance(target, Linear):
+        if isinstance(target, RandLoraLayer):
             target.update_layer(
                 adapter_name,
                 self.randlora_A,

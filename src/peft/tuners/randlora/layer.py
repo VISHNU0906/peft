@@ -51,11 +51,12 @@ class UniqueBaseGrad(torch.autograd.Function):
 class RandLoraLayer(BaseTunerLayer):
     # List all names of layers that may contain adapter weights
     adapter_layer_names = ("randlora_lambda", "randlora_gamma")
-    other_param_names = ("randlora_A", "randlora_B", "randlora_dropout", "r", "scaling")
+    other_param_names = ("randlora_A", "randlora_B", "randlora_dropout", "r", "scaling", "num_bases")
 
     def __init__(self, base_layer: nn.Module, **kwargs):
         self.base_layer = base_layer
         self.r = {}
+        self.num_bases = {}
         self.scaling = {}
         self.randlora_dropout = nn.ModuleDict({})
 
@@ -117,11 +118,11 @@ class RandLoraLayer(BaseTunerLayer):
 
         # Actual trainable parameters
         num_bases = min(self.in_features, self.out_features) / r
-        self.num_bases = int(num_bases) if num_bases.is_integer() else int(num_bases) + 1  # Full rank
-        self.randlora_lambda[adapter_name] = nn.Parameter(torch.randn(r, self.num_bases), requires_grad=True)
+        num_bases = int(num_bases) if num_bases.is_integer() else int(num_bases) + 1
+        self.num_bases[adapter_name] = num_bases  # Full rank
+        self.randlora_lambda[adapter_name] = nn.Parameter(torch.randn(r, num_bases), requires_grad=True)
         self.randlora_gamma[adapter_name] = nn.Parameter(
-            torch.ones(self.num_bases, min(self.out_features, self.in_features))
-            / max(self.out_features, self.in_features),
+            torch.ones(num_bases, min(self.out_features, self.in_features)) / max(self.out_features, self.in_features),
             requires_grad=True,
         )
 
@@ -136,9 +137,12 @@ class RandLoraLayer(BaseTunerLayer):
                 raise ValueError(
                     "The `randlora_A` and `randlora_B` buffers are empty. This should not happen. Please report this issue."
                 )
-            # we can take any of the existing adapter's parameters, as they should all be identical
-            randlora_A_param = next(iter(self.randlora_A.values()))
-            randlora_B_param = next(iter(self.randlora_B.values()))
+            # Reuse projections of the same rank when available. Direct layer updates can also use a rank prefix.
+            shared_adapter = next(
+                (name for name, basis in self.randlora_A.items() if basis.shape[0] == r), next(iter(self.randlora_A))
+            )
+            randlora_A_param = self.randlora_A[shared_adapter]
+            randlora_B_param = self.randlora_B[shared_adapter]
 
             error_tmpl = (
                 "{} has a size of {} but {} or greater is required; this probably happened because an additional RandLora "
@@ -292,11 +296,11 @@ class Linear(nn.Linear, RandLoraLayer):
         # The trainable parameters are always applied to randlora_A, the smallest basis.
         min_dim, max_dim = min(self.out_features, self.in_features), max(self.out_features, self.in_features)
 
-        # As adapted layers may have different shapes and RandLora contains a single shared pair of A and B matrices,
+        # As adapted layers may have different shapes and each adapter shares A and B matrices across its layers,
         # we initialize these matrices with the largest required size for each dimension.
         # During the forward pass, required submatrices are sliced out from the shared randlora_A and randlora_B.
-        sliced_A = randlora_A[:, : self.num_bases, :min_dim].to(device)
-        sliced_B = randlora_B[:max_dim, : self.num_bases, :].to(device)
+        sliced_A = randlora_A[: self.r[adapter], : self.num_bases[adapter], :min_dim].to(device)
+        sliced_B = randlora_B[:max_dim, : self.num_bases[adapter], : self.r[adapter]].to(device)
 
         # Flattening the matrices over the rank and number of bases dimensions is more memory efficient
         update_B = sliced_B.flatten(start_dim=1)

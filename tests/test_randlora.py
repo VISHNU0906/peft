@@ -15,8 +15,10 @@
 # This test file is for tests specific to RandLora, since Randlora has some specific challenges due to the shared weights.
 # These tests are copied from the test_vera.py file
 
+import copy
 import os
 import warnings
+from pathlib import Path
 
 import pytest
 import torch
@@ -24,6 +26,7 @@ from accelerate.utils.imports import is_bf16_available
 from safetensors import safe_open
 from safetensors.torch import save_file
 from torch import nn
+from transformers.pytorch_utils import Conv1D
 
 from peft import PeftModel, RandLoraConfig, get_peft_model, get_peft_model_state_dict, set_peft_model_state_dict
 
@@ -318,3 +321,154 @@ class TestRandLora:
         inputs = torch.randn(5, 10).to(dtype)
         output = peft_model(inputs)  # should not raise
         assert output.dtype == dtype
+
+    @pytest.mark.parametrize("layer_type", ["linear", "conv1d"])
+    @pytest.mark.parametrize("ranks", [(8, 4), (8, 3), (4, 8)])
+    @pytest.mark.parametrize("sparse", [None, "sparse", "very_sparse"])
+    @pytest.mark.parametrize("safe_merge", [False, True])
+    def test_mixed_rank_adapters_forward_merge(
+        self, ranks: tuple[int, int], sparse: str | None, safe_merge: bool, layer_type: str
+    ) -> None:
+        # Regression for #4125: adding an adapter must not change the first adapter's basis count.
+        torch.manual_seed(0)
+        if layer_type == "linear":
+            base_model = nn.Sequential(nn.Linear(16, 16), nn.ReLU(), nn.Linear(16, 8))
+        else:
+            base_model = nn.Sequential(Conv1D(16, 16), nn.ReLU(), Conv1D(8, 16))
+        model = get_peft_model(
+            base_model,
+            RandLoraConfig(
+                r=ranks[0],
+                target_modules=["0", "2"],
+                init_weights=False,
+                sparse=sparse == "sparse",
+                very_sparse=sparse == "very_sparse",
+                randlora_alpha=ranks[0],
+                fan_in_fan_out=layer_type == "conv1d",
+            ),
+            adapter_name="first",
+        ).eval()
+        inputs = torch.randn(2, 16)
+        expected_first = model(inputs).detach()
+        model.add_adapter(
+            "second",
+            RandLoraConfig(
+                r=ranks[1],
+                target_modules=["0", "2"],
+                init_weights=False,
+                sparse=sparse == "sparse",
+                very_sparse=sparse == "very_sparse",
+                randlora_alpha=ranks[1],
+                fan_in_fan_out=layer_type == "conv1d",
+            ),
+        )
+        torch.testing.assert_close(model(inputs), expected_first)
+        for adapter in ("first", "second"):
+            model.set_adapter(adapter)
+            expected = model(inputs)
+            with model.disable_adapter():
+                assert not torch.allclose(expected, model(inputs))
+            expected.sum().backward()
+            for layer in (base_model[0], base_model[2]):
+                assert layer.randlora_lambda[adapter].grad is not None
+                assert layer.randlora_gamma[adapter].grad is not None
+            model.merge_adapter(safe_merge=safe_merge)
+            torch.testing.assert_close(model(inputs), expected, atol=1e-5, rtol=1e-5)
+            model.unmerge_adapter()
+            torch.testing.assert_close(model(inputs), expected, atol=1e-4, rtol=1e-4)
+
+    @pytest.mark.parametrize("save_projection", [False, True])
+    @pytest.mark.parametrize("load_order", [("high", "low"), ("low", "high")])
+    @pytest.mark.parametrize("sparse", [None, "sparse", "very_sparse"])
+    def test_mixed_rank_adapters_roundtrip(
+        self, tmp_path: Path, save_projection: bool, load_order: tuple[str, str], sparse: str | None
+    ) -> None:
+        torch.manual_seed(0)
+        base_model = nn.Sequential(nn.Linear(16, 16), nn.Linear(16, 8))
+        original = copy.deepcopy(base_model)
+        model = get_peft_model(
+            base_model,
+            RandLoraConfig(
+                r=8, target_modules=["0", "1"], init_weights=False, save_projection=save_projection, sparse=sparse
+            ),
+            adapter_name="high",
+        ).eval()
+        model.add_adapter(
+            "low",
+            RandLoraConfig(
+                r=4, target_modules=["0", "1"], init_weights=False, save_projection=save_projection, sparse=sparse
+            ),
+        )
+        inputs = torch.randn(2, 16)
+        expected = {}
+        for adapter in ("high", "low"):
+            model.set_adapter(adapter)
+            expected[adapter] = model(inputs).detach()
+        model.save_pretrained(tmp_path)
+        first, second = load_order
+        loaded = PeftModel.from_pretrained(original, tmp_path / first, adapter_name=first).eval()
+        loaded.load_adapter(tmp_path / second, adapter_name=second)
+        for adapter in ("high", "low"):
+            loaded.set_adapter(adapter)
+            torch.testing.assert_close(loaded(inputs), expected[adapter])
+
+    def test_update_layer_slices_oversized_projection_rank(self) -> None:
+        # Shared projections are produced for the largest layer. A smaller layer can use their rank prefix.
+        torch.manual_seed(0)
+        model = get_peft_model(
+            nn.Sequential(nn.Linear(16, 16), nn.Linear(16, 8)),
+            RandLoraConfig(r=8, target_modules=["0", "1"], init_weights=False, randlora_alpha=8),
+        )
+        layer = model.base_model.model[1]
+        inputs = torch.randn(2, 16)
+        expected_default = layer(inputs).detach()
+        config = RandLoraConfig(r=4, target_modules=["1"], init_weights=False, randlora_alpha=4)
+        layer.update_layer("low", model.randlora_A, model.randlora_B, r=4, config=config)
+        torch.testing.assert_close(layer(inputs), expected_default)
+        layer.set_adapter("low")
+        expected = layer(inputs)
+        expected.sum().backward()
+        assert layer.randlora_lambda["low"].grad is not None
+        layer.merge()
+        torch.testing.assert_close(layer(inputs), expected)
+
+    def test_same_rank_adapters_share_projections_after_mixed_ranks(self) -> None:
+        model = get_peft_model(nn.Sequential(nn.Linear(16, 16)), RandLoraConfig(r=8, target_modules=["0"]))
+        for name in ("low", "other_low"):
+            model.add_adapter(name, RandLoraConfig(r=4, target_modules=["0"]))
+        assert model.randlora_A["low"] is model.randlora_A["other_low"]
+        assert model.randlora_B["low"] is model.randlora_B["other_low"]
+
+    def test_mixed_rank_weighted_adapter_is_not_supported(self) -> None:
+        model = get_peft_model(
+            nn.Sequential(nn.Linear(16, 16)), RandLoraConfig(r=8, target_modules=["0"], init_weights=False)
+        )
+        model.add_adapter("low", RandLoraConfig(r=4, target_modules=["0"], init_weights=False))
+        inputs = torch.randn(2, 16)
+        expected = model(inputs).detach()
+        # RandLoRA has no weighted-adapter API. Do not accidentally invoke another tuner's implementation.
+        with pytest.raises(AttributeError, match="add_weighted_adapter"):
+            model.add_weighted_adapter(["default", "low"], [0.5, 0.5], "combined")
+        torch.testing.assert_close(model(inputs), expected)
+
+    @pytest.mark.parametrize("deleted_adapter", ["default", "other"])
+    def test_delete_adapter_cleans_basis_count(self, deleted_adapter: str) -> None:
+        model = get_peft_model(
+            nn.Sequential(nn.Linear(16, 16)), RandLoraConfig(r=8, target_modules=["0"], init_weights=False)
+        )
+        model.add_adapter("other", RandLoraConfig(r=4, target_modules=["0"], init_weights=False))
+        remaining = "other" if deleted_adapter == "default" else "default"
+        model.set_adapter(remaining)
+        inputs = torch.randn(2, 16)
+        expected = model(inputs).detach()
+        model.delete_adapter(deleted_adapter)
+        layer = model.base_model.model[0]
+        assert layer.num_bases == {remaining: 4 if remaining == "other" else 2}
+        for name in layer.adapter_layer_names + layer.other_param_names:
+            assert deleted_adapter not in getattr(layer, name)
+        torch.testing.assert_close(model(inputs), expected)
+        model.add_adapter(deleted_adapter, RandLoraConfig(r=3, target_modules=["0"], init_weights=False))
+        model.set_adapter(deleted_adapter)
+        output = model(inputs)
+        model.merge_adapter()
+        torch.testing.assert_close(model(inputs), output, atol=1e-4, rtol=1e-4)

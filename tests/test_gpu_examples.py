@@ -7502,3 +7502,159 @@ class TestKappaTune:
         # loose bound. Without dequantization, the condition numbers would be off by a much larger factor.
         for name, kappa_fp in kappas_fp.items():
             assert 0.5 < kappas_8bit[name] / kappa_fp < 2
+
+
+@pytest.mark.single_gpu_tests
+@require_torch_gpu
+@require_bitsandbytes
+class TestRandLoraBnb:
+    @staticmethod
+    def make_model(
+        in_features: int, out_features: int, bits: int, weight: torch.Tensor | None = None, quant_type: str = "fp4"
+    ) -> torch.nn.Sequential:
+        import bitsandbytes as bnb
+
+        if bits == 8:
+            layer = bnb.nn.Linear8bitLt(in_features, out_features, bias=False, has_fp16_weights=False)
+        else:
+            layer = bnb.nn.Linear4bit(
+                in_features, out_features, bias=False, compute_dtype=torch.float32, quant_type=quant_type
+            )
+        if weight is not None:
+            layer.weight.data.copy_(weight.detach().cpu())
+        model = torch.nn.Sequential(layer).to(torch_device).eval()
+        setattr(model, f"is_loaded_in_{bits}bit", True)
+        return model
+
+    @pytest.mark.parametrize("bits,quant_type", [(8, "fp4"), (4, "fp4"), (4, "nf4")])
+    @pytest.mark.parametrize("shape", [(128, 64), (64, 128), (64, 64)])
+    @pytest.mark.parametrize("safe_merge", [False, True])
+    def test_merge_matches_dense(self, bits: int, quant_type: str, shape: tuple[int, int], safe_merge: bool) -> None:
+        # #4125: rectangular layers used to crash; square layers silently composed the maps backwards.
+        from peft.utils.integrations import dequantize_module_weight
+
+        torch.manual_seed(0)
+        quantized = self.make_model(*shape, bits, quant_type=quant_type)
+        dense = torch.nn.Sequential(torch.nn.Linear(*shape, bias=False)).to(torch_device)
+        dense[0].weight.data.copy_(dequantize_module_weight(quantized[0]))
+        config = RandLoraConfig(r=4, target_modules=["0"], init_weights=False, randlora_alpha=4)
+        quantized = get_peft_model(quantized, deepcopy(config)).eval()
+        dense = get_peft_model(dense, deepcopy(config)).float().eval()
+        q_layer, d_layer = quantized.base_model.model[0], dense.base_model.model[0]
+        for name in ("randlora_A", "randlora_B"):
+            getattr(q_layer, name)["default"] = getattr(d_layer, name)["default"]
+        for name in ("randlora_lambda", "randlora_gamma"):
+            getattr(q_layer, name)["default"].data.copy_(getattr(d_layer, name)["default"])
+        delta = d_layer.get_delta_weight("default")
+        torch.testing.assert_close(q_layer.get_delta_weight("default"), delta)
+        dense.merge_adapter(safe_merge=safe_merge)
+        # Quantize the independently merged dense weight, so quantization error cannot hide a wrong delta.
+        expected = self.make_model(*shape, bits, quant_type=quant_type, weight=d_layer.base_layer.weight)
+        quantized.merge_adapter(safe_merge=safe_merge)
+        torch.testing.assert_close(dequantize_module_weight(q_layer.base_layer), dequantize_module_weight(expected[0]))
+        inputs = torch.randn(2, shape[0], device=torch_device)
+        torch.testing.assert_close(quantized(inputs), expected(inputs))
+        expected_unmerged = self.make_model(
+            *shape, bits, quant_type=quant_type, weight=dequantize_module_weight(expected[0]) - delta
+        )
+        quantized.unmerge_adapter()
+        assert not q_layer.merged
+        torch.testing.assert_close(
+            dequantize_module_weight(q_layer.base_layer), dequantize_module_weight(expected_unmerged[0])
+        )
+        torch.testing.assert_close(
+            quantized(inputs),
+            expected_unmerged(inputs) + torch.nn.functional.linear(inputs, delta),
+            atol=1e-5,
+            rtol=1e-5,
+        )
+
+    @pytest.mark.parametrize("bits,quant_type", [(8, "fp4"), (4, "fp4"), (4, "nf4")])
+    @pytest.mark.parametrize("safe_merge", [False, True])
+    def test_mixed_rank_adapters_forward_merge(self, bits: int, quant_type: str, safe_merge: bool) -> None:
+        from peft.utils.integrations import dequantize_module_weight
+
+        torch.manual_seed(0)
+        model = get_peft_model(
+            self.make_model(64, 64, bits, quant_type=quant_type),
+            RandLoraConfig(r=8, target_modules=["0"], init_weights=False, randlora_alpha=8),
+            adapter_name="high",
+        ).eval()
+        inputs = torch.randn(2, 64, device=torch_device)
+        layer = model.base_model.model[0]
+        for name in ("randlora_A", "randlora_B"):
+            getattr(layer, name)["high"] = getattr(layer, name)["high"].float()
+        expected_high = model(inputs).detach()
+        model.add_adapter("low", RandLoraConfig(r=4, target_modules=["0"], init_weights=False, randlora_alpha=4))
+        # Reuse the wrapper instead of nesting another quantized RandLoRA wrapper inside it.
+        assert set(layer.r) == {"high", "low"}
+        torch.testing.assert_close(model(inputs), expected_high)
+        for adapter in ("high", "low"):
+            for name in ("randlora_A", "randlora_B"):
+                getattr(layer, name)[adapter] = getattr(layer, name)[adapter].float()
+            model.set_adapter(adapter)
+            output = model(inputs)
+            with model.disable_adapter():
+                assert not torch.allclose(output, model(inputs))
+            delta = layer.get_delta_weight(adapter)
+            expected = self.make_model(
+                64, 64, bits, quant_type=quant_type, weight=dequantize_module_weight(layer.base_layer) + delta
+            )
+            model.merge_adapter(safe_merge=safe_merge)
+            torch.testing.assert_close(
+                dequantize_module_weight(layer.base_layer), dequantize_module_weight(expected[0])
+            )
+            torch.testing.assert_close(model(inputs), expected(inputs))
+            expected_unmerged = self.make_model(
+                64, 64, bits, quant_type=quant_type, weight=dequantize_module_weight(expected[0]) - delta
+            )
+            model.unmerge_adapter()
+            torch.testing.assert_close(
+                dequantize_module_weight(layer.base_layer), dequantize_module_weight(expected_unmerged[0])
+            )
+            torch.testing.assert_close(
+                model(inputs),
+                expected_unmerged(inputs) + torch.nn.functional.linear(inputs, delta),
+                atol=1e-5,
+                rtol=1e-5,
+            )
+        model.set_adapter("high")
+        expected_high = model(inputs).detach()
+        model.delete_adapter("low")
+        assert layer.num_bases == {"high": 8}
+        torch.testing.assert_close(model(inputs), expected_high)
+
+    @pytest.mark.parametrize("bits,quant_type", [(8, "fp4"), (4, "fp4"), (4, "nf4")])
+    @pytest.mark.parametrize("save_projection", [False, True])
+    @pytest.mark.parametrize("load_order", [("high", "low"), ("low", "high")])
+    def test_mixed_rank_adapters_roundtrip(
+        self, bits: int, quant_type: str, save_projection: bool, load_order: tuple[str, str], tmp_path: Path
+    ) -> None:
+        torch.manual_seed(0)
+        base_model = self.make_model(64, 64, bits, quant_type=quant_type)
+        original = deepcopy(base_model)
+        model = get_peft_model(
+            base_model,
+            RandLoraConfig(
+                r=8, target_modules=["0"], init_weights=False, randlora_alpha=8, save_projection=save_projection
+            ),
+            adapter_name="high",
+        ).eval()
+        model.add_adapter(
+            "low",
+            RandLoraConfig(
+                r=4, target_modules=["0"], init_weights=False, randlora_alpha=4, save_projection=save_projection
+            ),
+        )
+        inputs = torch.randn(2, 64, device=torch_device)
+        expected = {}
+        for adapter in ("high", "low"):
+            model.set_adapter(adapter)
+            expected[adapter] = model(inputs).detach()
+        model.save_pretrained(tmp_path)
+        first, second = load_order
+        loaded = PeftModel.from_pretrained(original, tmp_path / first, adapter_name=first).eval()
+        loaded.load_adapter(tmp_path / second, adapter_name=second)
+        for adapter in ("high", "low"):
+            loaded.set_adapter(adapter)
+            torch.testing.assert_close(loaded(inputs), expected[adapter])

@@ -166,11 +166,11 @@ if is_bnb_available():
             # The trainable parameters are always applied to randlora_A, the smallest basis.
             min_dim, max_dim = min(self.out_features, self.in_features), max(self.out_features, self.in_features)
 
-            # As adapted layers may have different shapes and RandLora contains a single shared pair of A and B matrices,
+            # As adapted layers may have different shapes and each adapter shares A and B matrices across its layers,
             # we initialize these matrices with the largest required size for each dimension.
             # During the forward pass, required submatrices are sliced out from the shared randlora_A and randlora_B.
-            sliced_A = randlora_A[:, : self.num_bases, :min_dim].to(device)
-            sliced_B = randlora_B[:max_dim, : self.num_bases, :].to(device)
+            sliced_A = randlora_A[: self.r[adapter], : self.num_bases[adapter], :min_dim].to(device)
+            sliced_B = randlora_B[:max_dim, : self.num_bases[adapter], : self.r[adapter]].to(device)
 
             # Flattening the matrices over the rank and number of bases dimensions is more memory efficient
             update_B = sliced_B.flatten(start_dim=1)
@@ -191,7 +191,7 @@ if is_bnb_available():
 
             update_B, update_A = self.get_scaled_bases(adapter)
 
-            update = update_B @ update_A
+            update = (update_B.T @ update_A.T).T
             output_tensor = transpose(update, self.fan_in_fan_out)
 
             scaling = self.scaling[adapter]
@@ -316,6 +316,8 @@ if is_bnb_4bit_available():
                         f"NaNs detected in the merged weights. The adapter {active_adapter} seems to be broken"
                     )
 
+                if "bnb_quantized" in kwargs:
+                    kwargs["bnb_quantized"] = False
                 self.get_base_layer().weight = bnb.nn.Params4bit(w_data.to("cpu"), requires_grad=False, **kwargs).to(
                     weight.device
                 )
@@ -342,6 +344,8 @@ if is_bnb_4bit_available():
                 kwargs = weight.__dict__
                 w_data = bnb.functional.dequantize_4bit(weight.data, weight.quant_state) - randlora_data
 
+                if "bnb_quantized" in kwargs:
+                    kwargs["bnb_quantized"] = False
                 self.get_base_layer().weight = bnb.nn.Params4bit(w_data.to("cpu"), requires_grad=False, **kwargs).to(
                     weight.device
                 )
@@ -379,11 +383,11 @@ if is_bnb_4bit_available():
             # The trainable parameters are always applied to randlora_A, the smallest basis.
             min_dim, max_dim = min(self.out_features, self.in_features), max(self.out_features, self.in_features)
 
-            # As adapted layers may have different shapes and RandLora contains a single shared pair of A and B matrices,
+            # As adapted layers may have different shapes and each adapter shares A and B matrices across its layers,
             # we initialize these matrices with the largest required size for each dimension.
             # During the forward pass, required submatrices are sliced out from the shared randlora_A and randlora_B.
-            sliced_A = randlora_A[:, : self.num_bases, :min_dim].to(device)
-            sliced_B = randlora_B[:max_dim, : self.num_bases, :].to(device)
+            sliced_A = randlora_A[: self.r[adapter], : self.num_bases[adapter], :min_dim].to(device)
+            sliced_B = randlora_B[:max_dim, : self.num_bases[adapter], : self.r[adapter]].to(device)
             # Flattening the matrices over the rank and number of bases dimensions is more memory efficient
             update_B = sliced_B.flatten(start_dim=1)
             update_A = UniqueBaseGrad.apply(sliced_A, randlora_lambda, randlora_gamma).flatten(end_dim=1)
@@ -402,7 +406,7 @@ if is_bnb_4bit_available():
             """
             update_B, update_A = self.get_scaled_bases(adapter)
 
-            update = update_B @ update_A
+            update = (update_B.T @ update_A.T).T
             output_tensor = transpose(update, self.fan_in_fan_out)
 
             scaling = self.scaling[adapter]
